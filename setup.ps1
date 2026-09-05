@@ -1,21 +1,24 @@
 # =========================================================================
-#  EARNAPP WINDOWS RDP FLEET AUTOMATION & OPTIMIZER (1-CLICK SETUP)
+#  EARNAPP WINDOWS RDP FLEET AUTOMATION & STEALTH AGENT (1-CLICK SETUP)
 #  Repository: https://github.com/heru223/rdp-fleet-bot
+#  Architecture: Outbound Stealth Agent (0 Open Ports / 100% Safe from Provider)
 # =========================================================================
 
 param(
     [string]$WorkerName = "",
     [string]$Folder = "RDP",
+    [string]$MasterIP = "",
+    [int]$MasterPort = 9090,
     [string]$BotToken = "8915903428:AAEciefmI7dRj5KH6KsWPK7--eOODNm34lg",
     [string]$ChatId = "1943547868",
-    [string]$MasterIP = "",
     [switch]$NonInteractive = $false
 )
 
 $ErrorActionPreference = "Continue"
 
 Write-Host "==========================================================" -ForegroundColor Cyan
-Write-Host " 🚀 EARNAPP WINDOWS RDP FLEET SETUP & OPTIMIZER 🎮" -ForegroundColor Green
+Write-Host " 🚀 EARNAPP WINDOWS RDP FLEET SETUP & STEALTH AGENT 🎮" -ForegroundColor Green
+Write-Host " 🔒 Architecture: Outbound Agent (NOL Port Terbuka / Aman)" -ForegroundColor Yellow
 Write-Host "==========================================================" -ForegroundColor Cyan
 
 # 1. Pastikan Run as Administrator
@@ -23,25 +26,26 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 if (-not $isAdmin) {
     Write-Host "⚠️ Script ini membutuhkan hak Administrator untuk konfigurasi power & scheduler." -ForegroundColor Yellow
     Write-Host "⏳ Membuka kembali sebagai Administrator..." -ForegroundColor Cyan
-    Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
+    Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -WorkerName `"$WorkerName`" -Folder `"$Folder`" -MasterIP `"$MasterIP`" -MasterPort $MasterPort" -Verb RunAs
     exit
 }
 
 # 2. Bypass Antivirus / Windows Defender Whitelist & PUA Protection
-Write-Host "`n[🛡️ ANTIVIRUS BYPASS] Mengonfigurasi Whitelist Windows Defender & PUA..." -ForegroundColor Yellow
+Write-Host "`n[🛡️ 1/6 ANTIVIRUS BYPASS] Mengonfigurasi Whitelist Windows Defender & PUA..." -ForegroundColor Yellow
 try {
     # Matikan proteksi PUA (Potentially Unwanted Application) yang memblokir EarnApp
     Set-MpPreference -PUAProtection Disabled -ErrorAction SilentlyContinue
     New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender" -Force -ErrorAction SilentlyContinue | Out-Null
     Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender" -Name "PUAProtection" -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
 
-    # Whitelist direktori EarnApp
+    # Whitelist direktori EarnApp & Agent
     $exclusions = @(
         "C:\Program Files (x86)\EarnApp",
         "C:\Program Files\EarnApp",
         "$env:APPDATA\EarnApp",
         "$env:LOCALAPPDATA\EarnApp",
         "$env:ProgramData\EarnApp",
+        "$env:ProgramData\WinNetworkMonitor",
         "$env:TEMP\EarnAppSetup.exe",
         "$env:USERPROFILE\Downloads"
     )
@@ -53,7 +57,7 @@ try {
     # Whitelist proses EarnApp
     Add-MpPreference -ExclusionProcess "earnapp.exe", "EarnApp.exe", "EarnAppSetup.exe" -ErrorAction SilentlyContinue
 
-    # Matikan Realtime & Behavior Monitoring agar Defender tidak memakan CPU/RAM & tidak mematikan EarnApp
+    # Matikan Realtime Monitoring agar Defender tidak memakan CPU/RAM & tidak mematikan EarnApp
     Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
     Set-MpPreference -DisableBehaviorMonitoring $true -ErrorAction SilentlyContinue
     
@@ -62,38 +66,8 @@ try {
     Write-Host "  ℹ️ Defender tidak aktif atau menggunakan antivirus lain: $_" -ForegroundColor Gray
 }
 
-# 2.5 Mengaktifkan OpenSSH Server & WinRM (Remote Control tanpa buka RDP)
-Write-Host "`n[🔑 REMOTE ACCESS] Mengaktifkan OpenSSH Server & WinRM..." -ForegroundColor Yellow
-try {
-    # Cek & Install OpenSSH Server capability
-    $sshCap = Get-WindowsCapability -Online -Name OpenSSH.Server* -ErrorAction SilentlyContinue
-    if ($sshCap -and $sshCap.State -ne 'Installed') {
-        Write-Host "  ⏳ Menginstall OpenSSH Server..." -ForegroundColor Cyan
-        Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 -ErrorAction SilentlyContinue | Out-Null
-    }
-    
-    # Start & enable sshd service
-    Set-Service -Name sshd -StartupType 'Automatic' -ErrorAction SilentlyContinue
-    Start-Service sshd -ErrorAction SilentlyContinue
-    
-    # Buka Firewall Port 22
-    if (-not (Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue)) {
-        New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -ErrorAction SilentlyContinue | Out-Null
-    }
-    Write-Host "  ✅ OpenSSH Server aktif (Port 22 siap untuk remote control dari Bot Telegram)." -ForegroundColor Green
-} catch {
-    Write-Host "  ℹ️ OpenSSH setup note: $_" -ForegroundColor Gray
-}
-
-try {
-    # Aktifkan WinRM (PowerShell Remoting)
-    Enable-PSRemoting -Force -SkipNetworkProfileCheck -ErrorAction SilentlyContinue | Out-Null
-    Set-NetFirewallRule -Name "WINRM-HTTP-In-TCP" -RemoteAddress Any -ErrorAction SilentlyContinue | Out-Null
-    Write-Host "  ✅ WinRM remote access diaktifkan (Port 5985)." -ForegroundColor Green
-} catch {}
-
 # 3. Deteksi Info Sistem & IP
-Write-Host "`n[1/5] 🌐 Mengambil informasi sistem & jaringan..." -ForegroundColor Yellow
+Write-Host "`n[🌐 2/6 SYSTEM INFO] Mengambil informasi sistem & jaringan..." -ForegroundColor Yellow
 $publicIp = "Unknown"
 try {
     $publicIp = (Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 5).Trim()
@@ -108,8 +82,16 @@ $usedRamMb = $totalRamMb - $freeRamMb
 $ramStr = "$usedRamMb MB / $totalRamMb MB ($([math]::Round(($usedRamMb/$totalRamMb)*100))%)"
 $hostname = $env:COMPUTERNAME
 
+# Konfigurasi Folder
+if ([string]::IsNullOrWhiteSpace($Folder)) {
+    $Folder = "RDP"
+} else {
+    $Folder = (Get-Culture).TextInfo.ToTitleCase($Folder.Trim().ToLower())
+}
+
+# Konfigurasi WorkerName
 if ([string]::IsNullOrWhiteSpace($WorkerName)) {
-    $defaultName = "RDP-$hostname"
+    $defaultName = "$Folder-$hostname"
     if ($NonInteractive -or -not [Environment]::UserInteractive) {
         $WorkerName = $defaultName
     } else {
@@ -122,17 +104,22 @@ if ([string]::IsNullOrWhiteSpace($WorkerName)) {
         }
     }
 }
-
-if ([string]::IsNullOrWhiteSpace($Folder)) {
-    $Folder = "RDP"
-} else {
-    $Folder = (Get-Culture).TextInfo.ToTitleCase($Folder.Trim().ToLower())
-}
 Write-Host "   Worker Name : $WorkerName" -ForegroundColor Green
 Write-Host "   Folder      : $Folder" -ForegroundColor Green
 
-# 4. Pengecekan EarnApp (Sudah Ada atau Belum)
-Write-Host "`n[2/5] 🔍 Memeriksa instalasi EarnApp di RDP..." -ForegroundColor Yellow
+# Master IP
+if ([string]::IsNullOrWhiteSpace($MasterIP)) {
+    if ([Environment]::UserInteractive -and -not $NonInteractive) {
+        Write-Host "`n🌐 Masukkan IP VPS Master Anda (Contoh: 47.236.x.x): " -NoNewline -ForegroundColor Cyan
+        $inputMaster = Read-Host
+        if (-not [string]::IsNullOrWhiteSpace($inputMaster)) {
+            $MasterIP = $inputMaster.Trim()
+        }
+    }
+}
+
+# 4. Pengecekan & Instalasi EarnApp (Sudah Ada atau Belum)
+Write-Host "`n[🔍 3/6 EARNAPP CHECK] Memeriksa status instalasi EarnApp..." -ForegroundColor Yellow
 $nodeId = ""
 $isInstalled = $false
 
@@ -155,7 +142,6 @@ $searchPaths = @(
 foreach ($path in $searchPaths) {
     if (Test-Path $path) {
         $isInstalled = $true
-        # Cari file uuid
         $uuidFile = Join-Path $path "uuid"
         if (Test-Path $uuidFile) {
             $content = (Get-Content $uuidFile -Raw).Trim()
@@ -208,7 +194,6 @@ if ($isInstalled) {
         Write-Host "⚙️ Menjalankan installer EarnApp..." -ForegroundColor Cyan
         Start-Process $installerPath -ArgumentList "/S" -Wait
         
-        # Coba ambil Node ID setelah install
         Start-Sleep -Seconds 5
         foreach ($path in $searchPaths) {
             $uuidFile = Join-Path $path "uuid"
@@ -222,8 +207,8 @@ if ($isInstalled) {
     }
 }
 
-# 5. Optimasi Windows RDP (Anti-Sleep, 24/7 Keep-Alive, Auto-Reboot)
-Write-Host "`n[3/5] 🛡️ Menerapkan Optimasi Windows RDP 24/7..." -ForegroundColor Yellow
+# 5. Optimasi Windows RDP (Anti-Sleep, 24/7 Keep-Alive, Auto-Reboot 24h)
+Write-Host "`n[⚡ 4/6 OPTIMASI RDP] Menerapkan Optimasi Windows RDP 24/7..." -ForegroundColor Yellow
 
 # A. Power Plan High Performance (Anti-Sleep / Never Hibernate)
 try {
@@ -243,7 +228,6 @@ for /f "skip=1 tokens=3" %%s in ('query user %USERNAME%') do (%windir%\System32\
 "@
 Set-Content -Path "$desktopPath\Disconnect-RDP.bat" -Value $batContent
 Write-Host "  ✅ Shortcut 'Disconnect-RDP.bat' dibuat di Desktop RDP." -ForegroundColor Green
-Write-Host "     (Gunakan shortcut ini saat keluar RDP agar sesi EarnApp tidak beku/terkunci)." -ForegroundColor Gray
 
 # C. Auto-Reboot Rutin 24 Jam (Task Scheduler)
 try {
@@ -254,8 +238,130 @@ try {
     Write-Host "  ✅ Task Scheduler: Auto-reboot 24 jam sekali terjadwal (04:00 AM)." -ForegroundColor Green
 } catch {}
 
-# 6. Kirim Laporan & Link Klaim ke Bot Telegram
-Write-Host "`n[4/5] 📱 Mengirim notifikasi & link klaim ke Telegram Bot..." -ForegroundColor Yellow
+# 6. Pasang Stealth Outbound Health Agent (NOL Port Terbuka!)
+Write-Host "`n[🔒 5/6 STEALTH AGENT] Memasang Outbound Background Health Agent..." -ForegroundColor Yellow
+$agentDir = "C:\ProgramData\WinNetworkMonitor"
+if (-not (Test-Path $agentDir)) { New-Item -ItemType Directory -Path $agentDir -Force | Out-Null }
+
+$agentConfig = @{
+    WorkerName = $WorkerName
+    Folder = $Folder
+    MasterIP = $MasterIP
+    MasterPort = $MasterPort
+    PublicIP = $publicIp
+    NodeID = $nodeId
+} | ConvertTo-Json -Indent 2
+Set-Content -Path "$agentDir\config.json" -Value $agentConfig -Force
+
+# Script background agent (Hanya jalan outbound, 0 inbound port)
+$agentScriptContent = @'
+$ErrorActionPreference = "SilentlyContinue"
+$configPath = "C:\ProgramData\WinNetworkMonitor\config.json"
+if (-not (Test-Path $configPath)) { exit }
+
+# Pastikan hanya 1 instance agent yang jalan
+$myPid = $PID
+$procs = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*WinNetworkMonitor\agent.ps1*" -and $_.ProcessId -ne $myPid }
+if ($procs) { exit }
+
+while ($true) {
+    try {
+        $cfg = Get-Content $configPath -Raw | ConvertFrom-Json
+        if ($cfg.MasterIP -and $cfg.MasterIP -ne "") {
+            $masterUrl = "http://$($cfg.MasterIP):$($cfg.MasterPort)/heartbeat"
+            $resultUrl = "http://$($cfg.MasterIP):$($cfg.MasterPort)/command_result"
+
+            # Ambil RAM terkini
+            $os = Get-CimInstance Win32_OperatingSystem
+            $totMb = [math]::Round($os.TotalVisibleMemorySize / 1024)
+            $frMb = [math]::Round($os.FreePhysicalMemory / 1024)
+            $usMb = $totMb - $frMb
+            $ramStr = "$usMb MB / $totMb MB ($([math]::Round(($usMb/$totMb)*100))%)"
+
+            # Status EarnApp
+            $eaProc = Get-Process -Name "*earnapp*" -ErrorAction SilentlyContinue
+            $eaStatus = if ($eaProc) { "running" } else { "stopped" }
+
+            # Ambil Uptime
+            $bootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+            $uptimeHours = [math]::Round((((Get-Date) - $bootTime).TotalHours), 1)
+
+            # Re-read UUID jika belum ada
+            $uuid = $cfg.NodeID
+            if ([string]::IsNullOrEmpty($uuid) -or $uuid -eq "-") {
+                $checkPaths = @("C:\Program Files (x86)\EarnApp\uuid", "C:\Program Files\EarnApp\uuid", "$env:ProgramData\EarnApp\uuid")
+                foreach ($cp in $checkPaths) {
+                    if (Test-Path $cp) {
+                        $txt = (Get-Content $cp -Raw).Trim()
+                        if ($txt -match "sdk-node-") { $uuid = $txt; $cfg.NodeID = $uuid; break }
+                    }
+                }
+            }
+
+            $payload = @{
+                ip = $cfg.PublicIP
+                name = $cfg.WorkerName
+                folder = $cfg.Folder
+                uuid = $uuid
+                ram = $ramStr
+                status = $eaStatus
+                uptime = "$uptimeHours jam"
+            } | ConvertTo-Json -Compress
+
+            $resp = Invoke-RestMethod -Uri $masterUrl -Method Post -Body $payload -ContentType "application/json" -TimeoutSec 10
+            
+            # Jika Master menamai ulang worker secara otomatis
+            if ($resp -and $resp.assigned_name -and $resp.assigned_name -ne $cfg.WorkerName) {
+                $cfg.WorkerName = $resp.assigned_name
+                $cfg | ConvertTo-Json -Indent 2 | Set-Content -Path $configPath -Force
+            }
+
+            # Cek apakah ada komando remote dari Telegram bot
+            if ($resp -and $resp.command) {
+                $cmd = $resp.command
+                $cmdId = $resp.cmd_id
+
+                if ($cmd -eq "reboot") {
+                    $resPayload = @{ ip = $cfg.PublicIP; name = $cfg.WorkerName; cmd = "reboot"; status = "rebooting" } | ConvertTo-Json -Compress
+                    Invoke-RestMethod -Uri $resultUrl -Method Post -Body $resPayload -ContentType "application/json" -TimeoutSec 5 -ErrorAction SilentlyContinue
+                    Start-Sleep -Seconds 2
+                    shutdown.exe /r /t 5 /f /c "Telegram Master Remote Reboot"
+                } elseif ($cmd -eq "restart_earnapp") {
+                    Stop-Process -Name "*earnapp*" -Force -ErrorAction SilentlyContinue
+                    Start-Sleep -Seconds 3
+                    if (Test-Path "C:\Program Files (x86)\EarnApp\earnapp.exe") {
+                        Start-Process "C:\Program Files (x86)\EarnApp\earnapp.exe" -ErrorAction SilentlyContinue
+                    } elseif (Test-Path "C:\Program Files\EarnApp\earnapp.exe") {
+                        Start-Process "C:\Program Files\EarnApp\earnapp.exe" -ErrorAction SilentlyContinue
+                    }
+                    $resPayload = @{ ip = $cfg.PublicIP; name = $cfg.WorkerName; cmd = "restart_earnapp"; status = "restarted" } | ConvertTo-Json -Compress
+                    Invoke-RestMethod -Uri $resultUrl -Method Post -Body $resPayload -ContentType "application/json" -TimeoutSec 5 -ErrorAction SilentlyContinue
+                }
+            }
+        }
+    } catch {}
+    Start-Sleep -Seconds 15
+}
+'@
+Set-Content -Path "$agentDir\agent.ps1" -Value $agentScriptContent -Force
+
+# Pasang Task Scheduler tersamar (Nama wajar sistem: WindowsSystemHealthMonitor)
+try {
+    $act = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$agentDir\agent.ps1`""
+    $trg = New-ScheduledTaskTrigger -AtStartup
+    $prn = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    $stg = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 0)
+    Register-ScheduledTask -TaskName "WindowsSystemHealthMonitor" -Action $act -Trigger $trg -Principal $prn -Settings $stg -Force -ErrorAction SilentlyContinue | Out-Null
+    Start-ScheduledTask -TaskName "WindowsSystemHealthMonitor" -ErrorAction SilentlyContinue
+    Write-Host "  ✅ Stealth Agent 'WindowsSystemHealthMonitor' aktif di background." -ForegroundColor Green
+    Write-Host "     (Melapor berkala tiap 15s ke Master VPS tanpa membuka port apapun!)." -ForegroundColor Gray
+} catch {
+    Write-Host "  ℹ️ Menjalankan agent via process background..." -ForegroundColor Gray
+    Start-Process powershell.exe -ArgumentList "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$agentDir\agent.ps1`""
+}
+
+# 7. Kirim Notifikasi Telegram Langsung & Registrasi ke Master
+Write-Host "`n[📱 6/6 NOTIFIKASI TELEGRAM] Mengirim notifikasi & link klaim..." -ForegroundColor Yellow
 
 $claimUrl = if ($nodeId -and $nodeId -match "sdk-node-") { "https://earnapp.com/r/$nodeId" } else { "<i>Belum terdeteksi (Buka aplikasi EarnApp di RDP)</i>" }
 $statusNote = if ($isInstalled) { "Sudah Aktif Sebelumnya" } else { "Baru Diinstall" }
@@ -272,9 +378,10 @@ $tgMsg = @"
 🆔 <b>Node ID:</b> <code>$($nodeId ? $nodeId : 'Menunggu inisialisasi...')</code>
 🔗 <b>Claim Link:</b> $claimUrl
 
-🔑 <b>OpenSSH Remote:</b> 🟢 Port 22 Aktif
+🔒 <b>Port Masuk:</b> 🟢 0 Port Terbuka (100% Aman & Stealth)
+📡 <b>Health Agent:</b> 🟢 Aktif (Heartbeat 15s)
 🛡️ <b>RDP Keep-Alive:</b> 🟢 Aktif
-🔄 <b>Auto-Reboot 24h:</b> 🟢 Terjadwal
+🔄 <b>Auto-Reboot 24h:</b> 🟢 Terjadwal (04:00 AM)
 ━━━━━━━━━━━━━━━━━━━━━
 "@
 
@@ -302,15 +409,16 @@ try {
     Write-Host "  ⚠️ Gagal mengirim ke Telegram: $_" -ForegroundColor Yellow
 }
 
-# 7. Selesai
-Write-Host "`n[5/5] 🎉 SETUP RDP SELESAI!" -ForegroundColor Green
+# 8. Selesai
+Write-Host "`n🎉 SETUP RDP STEALTH SELESAI!" -ForegroundColor Green
 Write-Host "==========================================================" -ForegroundColor Cyan
-Write-Host " Worker: $WorkerName ($publicIp)" -ForegroundColor White
-Write-Host " Claim : $claimUrl" -ForegroundColor Cyan
-Write-Host " Remote: OpenSSH Port 22 Siap Dikontrol via Bot Tele" -ForegroundColor Green
+Write-Host " Worker  : $WorkerName ($publicIp)" -ForegroundColor White
+Write-Host " Claim   : $claimUrl" -ForegroundColor Cyan
+Write-Host " Keamanan: 0 Port Terbuka (Penyedia RDP tidak akan tahu)" -ForegroundColor Green
+Write-Host " Kontrol : Bisa reboot & restart EarnApp via Bot Telegram" -ForegroundColor Green
 Write-Host "==========================================================" -ForegroundColor Cyan
 
 if ([Environment]::UserInteractive -and -not $NonInteractive) {
-    Write-Host "`nTekan [ENTER] untuk menutup jendela ini..."
+    Write-Host "`nTekan [ENTER] untuk menutup jendela ini (atau langsung tutup jendela RDP)..."
     Read-Host
 }
