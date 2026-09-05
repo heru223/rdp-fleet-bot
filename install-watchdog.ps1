@@ -195,7 +195,7 @@ $runCmdPath = "$dir\run.cmd"
 $runCmdContent = "@echo off`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$watchdogScriptPath`"`r`n"
 Set-Content -Path $runCmdPath -Value $runCmdContent -Encoding ASCII -Force
 
-# 5. Buat tool Cek Status (status.cmd) & Shortcut Desktop
+# 5. Buat tool Cek Status (status.cmd) di C:\EarnAppWatchdog (Tanpa Icon Desktop)
 $statusCmdPath = "$dir\status.cmd"
 $statusContent = @"
 @echo off
@@ -219,18 +219,9 @@ pause
 "@
 Set-Content -Path $statusCmdPath -Value $statusContent -Encoding ASCII -Force
 
-# Letakkan Shortcut Status di Desktop Pengguna
-$desktopPaths = @(
-    [Environment]::GetFolderPath("Desktop"),
-    "C:\Users\Public\Desktop"
-)
-foreach ($dp in $desktopPaths) {
-    if (Test-Path $dp) {
-        $desktopBat = "$dp\Cek-EarnApp-Status.bat"
-        Set-Content -Path $desktopBat -Value "call `"$statusCmdPath`"" -Encoding ASCII -Force
-    }
-}
-Write-Host "  [OK] Shortcut 'Cek-EarnApp-Status.bat' dibuat di Desktop." -ForegroundColor Green
+# Bersihkan icon dari Desktop agar tampilan bersih total
+Remove-Item "C:\Users\*\Desktop\Cek-EarnApp-Status.bat" -Force -ErrorAction SilentlyContinue
+Remove-Item "C:\Users\Public\Desktop\Cek-EarnApp-Status.bat" -Force -ErrorAction SilentlyContinue
 
 # 6. Registrasi Task Scheduler (Setiap 2 Menit & Saat Startup)
 Write-Host "  [*] Mendaftarkan Task Scheduler (Jalan tiap 2 menit sebagai SYSTEM)..." -ForegroundColor Cyan
