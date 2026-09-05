@@ -51,10 +51,7 @@ try {
     Add-MpPreference -ExclusionPath $exclusions -ErrorAction SilentlyContinue
     Add-MpPreference -ExclusionProcess "earnapp.exe", "EarnApp.exe", "EarnAppSetup.exe" -ErrorAction SilentlyContinue
 
-    # Set PUA Protection ke 0 agar EarnApp proxyware tidak diflag
-    Set-MpPreference -PUAProtection 0 -ErrorAction SilentlyContinue
-
-    Write-Host "  ✅ Whitelist Defender berhasil diterapkan (EarnApp bebas blokir PUA)." -ForegroundColor Green
+    Write-Host "  ✅ Whitelist Defender berhasil diterapkan." -ForegroundColor Green
 } catch {
     Write-Host "  ℹ️ Defender note: $_" -ForegroundColor Gray
 }
