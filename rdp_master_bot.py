@@ -2,12 +2,12 @@
 """
 EarnApp Windows RDP Fleet Master Controller Bot
 - Dedicated Telegram Bot for Windows RDP fleet management (@RdpfleetBot)
-- Headless remote setup via SSH / WinRM: Add RDP directly from Telegram without opening RDP GUI!
+- Architecture: Outbound Stealth Agent (0 Open Ports on Windows RDPs!)
+- Master Command Queue: Remote Reboot & Restart EarnApp delivered via 15s Heartbeat
 - Automatic worker naming based on folder (e.g. nayla-1, nayla-2, nayla-3)
-- Remote execution: Reboot RDP, Restart EarnApp, Check status over SSH
 - Multi-folder & grouping system
 - Node ID & Claim URL tracker with 1-click inline buttons
-- Lightweight HTTP registration / heartbeat listener (port 9090)
+- Built-in HTTP listener (port 9090) for agent heartbeats & task execution
 """
 
 import os
@@ -16,8 +16,6 @@ import time
 import json
 import re
 import html
-import socket
-import subprocess
 import threading
 import urllib.request
 import urllib.parse
@@ -32,7 +30,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DEFAULT_CONFIG = {
     "bot_token": "8915903428:AAEciefmI7dRj5KH6KsWPK7--eOODNm34lg",
     "allowed_chat_id": "1943547868",
-    "http_port": 9090
+    "http_port": 9090,
+    "master_ip": "AUTO"
 }
 
 def load_config():
@@ -50,13 +49,34 @@ def load_config():
                 json.dump(cfg, f, indent=2)
         except Exception:
             pass
-    return cfg.get("bot_token"), int(cfg.get("allowed_chat_id", 1943547868)), int(cfg.get("http_port", 9090))
+    return cfg.get("bot_token"), int(cfg.get("allowed_chat_id", 1943547868)), int(cfg.get("http_port", 9090)), cfg.get("master_ip", "AUTO")
 
-BOT_TOKEN, ADMIN_CHAT_ID, HTTP_PORT = load_config()
+BOT_TOKEN, ADMIN_CHAT_ID, HTTP_PORT, CFG_MASTER_IP = load_config()
 
 NODES_LOCK = threading.Lock()
 LAST_DASHBOARD_MSG = {"chat_id": None, "message_id": None, "view": None}
 USER_STATES = {}
+PENDING_COMMANDS = {}  # key: ip or name, value: {"command": "reboot"|"restart_earnapp", "cmd_id": "...", "timestamp": ...}
+
+MASTER_PUBLIC_IP = None
+
+def get_master_public_ip():
+    global MASTER_PUBLIC_IP
+    if MASTER_PUBLIC_IP:
+        return MASTER_PUBLIC_IP
+    if CFG_MASTER_IP and CFG_MASTER_IP != "AUTO":
+        MASTER_PUBLIC_IP = CFG_MASTER_IP
+        return MASTER_PUBLIC_IP
+    for url in ["https://api.ipify.org", "https://icanhazip.com", "https://checkip.amazonaws.com"]:
+        try:
+            with urllib.request.urlopen(url, timeout=4) as r:
+                ip = r.read().decode('utf-8').strip()
+                if ip:
+                    MASTER_PUBLIC_IP = ip
+                    return ip
+        except Exception:
+            pass
+    return "IP_VPS_MASTER"
 
 MAIN_REPLY_KEYBOARD = {
     "keyboard": [
@@ -67,16 +87,6 @@ MAIN_REPLY_KEYBOARD = {
     "resize_keyboard": True,
     "persistent": True
 }
-
-def check_tcp_port(host, port, timeout=3):
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        result = sock.connect_ex((host, port))
-        sock.close()
-        return result == 0
-    except Exception:
-        return False
 
 def load_nodes():
     if os.path.exists(NODES_FILE):
@@ -91,15 +101,16 @@ def load_nodes():
                             res.append({
                                 "ip": k,
                                 "name": v.get("name", k),
-                                "pwd": v.get("pwd", ""),
                                 "uuid": v.get("uuid", "-"),
                                 "folder": v.get("folder", "RDP"),
                                 "ram": v.get("ram", "-"),
+                                "status": v.get("status", "running"),
+                                "uptime": v.get("uptime", "-"),
                                 "os": v.get("os", "Windows"),
                                 "last_seen": v.get("last_seen", 0)
                             })
                         else:
-                            res.append({"ip": k, "name": str(v), "pwd": "", "uuid": "-", "folder": "RDP", "ram": "-", "last_seen": 0})
+                            res.append({"ip": k, "name": str(v), "uuid": "-", "folder": "RDP", "ram": "-", "last_seen": 0})
                     return res
         except Exception:
             pass
@@ -112,10 +123,11 @@ def save_nodes(nodes):
             ip = n.get("ip", "unknown")
             dict_format[ip] = {
                 "name": n.get("name", ip),
-                "pwd": n.get("pwd", ""),
                 "uuid": n.get("uuid", "-"),
                 "folder": n.get("folder", "RDP"),
                 "ram": n.get("ram", "-"),
+                "status": n.get("status", "running"),
+                "uptime": n.get("uptime", "-"),
                 "os": n.get("os", "Windows"),
                 "last_seen": n.get("last_seen", int(time.time()))
             }
@@ -150,15 +162,6 @@ def get_next_worker_name(folder_name):
         next_num += 1
     return f"{folder_clean}-{next_num}"
 
-def get_all_folders():
-    nodes = load_nodes()
-    folders = {}
-    for n in nodes:
-        f = get_node_folder(n)
-        folders.setdefault(f, []).append(n)
-    sorted_names = sorted(folders.keys(), key=lambda x: (x.lower() == "rdp", x.lower()))
-    return {k: folders[k] for k in sorted_names}
-
 def tg_call(method, params=None, timeout=30):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     try:
@@ -192,188 +195,157 @@ def answer_callback(cb_id, text=None, show_alert=False):
         p["show_alert"] = "true" if show_alert else "false"
     return tg_call("answerCallbackQuery", p)
 
-# =========================================================================
-#  REMOTE SSH & WINRM PROVISIONING ENGINE
-# =========================================================================
-
-def execute_remote_windows_ssh(ip, password, cmd, timeout=60, user="Administrator"):
+def queue_command(target_id, command):
     """
-    Executes PowerShell command on Windows RDP via SSH using sshpass.
+    Queues a command ('reboot' or 'restart_earnapp') for a specific RDP.
+    Delivered automatically on the next 15-second heartbeat.
     """
-    ssh_cmd = [
-        "sshpass", "-p", password,
-        "ssh",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "ConnectTimeout=8",
-        f"{user}@{ip}",
-        cmd
-    ]
-    try:
-        res = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=timeout)
-        return res.returncode, res.stdout, res.stderr
-    except subprocess.TimeoutExpired:
-        return -1, "", "Timeout"
-    except Exception as e:
-        return -2, "", str(e)
-
-def setup_rdp_remote(ip, password, folder=None, name=None, user="Administrator"):
-    """
-    Connects to Windows RDP over SSH, runs setup.ps1 non-interactively.
-    Returns (success: bool, message: str, node_id: str, claim_link: str)
-    """
-    if not folder:
-        folder = "RDP"
-    folder = folder.strip().capitalize()
-
-    if not name:
-        worker_name = get_next_worker_name(folder)
-    else:
-        worker_name = name.strip()
-
-    # 1. Cek apakah port 22 (SSH) terbuka
-    port_22_open = check_tcp_port(ip, 22, timeout=4)
-    if not port_22_open:
-        # Simpan worker dengan status pending setup
-        with NODES_LOCK:
-            nodes = load_nodes()
-            found = False
-            for n in nodes:
-                if n.get("ip") == ip:
-                    n["name"] = worker_name
-                    n["folder"] = folder
-                    n["pwd"] = password
-                    found = True
-                    break
-            if not found:
-                nodes.append({"ip": ip, "name": worker_name, "folder": folder, "pwd": password, "uuid": "-", "ram": "-", "last_seen": 0})
-            save_nodes(nodes)
-
-        setup_cmd = "irm https://raw.githubusercontent.com/heru223/rdp-fleet-bot/main/setup.ps1 | iex"
-        err_msg = (
-            f"⚠️ <b>Port SSH (22) di RDP <code>{html.escape(ip)}</code> tertutup atau diblokir provider.</b>\n\n"
-            f"Provider RDP Anda mengunci port remote secara default dan hanya membuka port 3389 (layar).\n\n"
-            f"💡 <b>Solusi 1-Klik Sekali Saja (Hanya butuh 5 detik):</b>\n"
-            f"1. Buka RDP sekali via Remote Desktop.\n"
-            f"2. Buka <b>PowerShell (Run as Admin)</b>, lalu paste perintah ini:\n\n"
-            f"<code>{setup_cmd}</code>\n\n"
-            f"✨ Script ini otomatis:\n"
-            f"• Mengaktifkan OpenSSH Server & membuka port 22 di Firewall Windows\n"
-            f"• Whitelist Defender & Anti-virus (bebas deteksi virus/PUA)\n"
-            f"• Auto-reboot 24 jam & Anti-sleep Keep-Alive\n"
-            f"• Mengirimkan link klaim ke bot ini\n\n"
-            f"🔥 <i>Setelah dijalankan 1x ini, seterusnya RDP ini 100% BISA DIKONTROL DARI TELEGRAM (reboot, restart earnapp, cek status) tanpa login RDP lagi!</i>"
-        )
-        return False, err_msg, "", ""
-
-    # 2. Port 22 terbuka -> Tes login SSH & jalankan setup.ps1
-    test_rc, _, test_err = execute_remote_windows_ssh(ip, password, "powershell -Command Write-Host 'SSH_OK'", timeout=12, user=user)
-    if test_rc != 0:
-        return False, f"❌ Gagal login SSH ke <code>{html.escape(ip)}</code> dengan user <code>{html.escape(user)}</code>.\nPastikan password benar!\n\n<i>Detail: {html.escape(test_err[:150])}</i>", "", ""
-
-    # 3. Jalankan installer setup.ps1 secara headless di background Windows RDP
-    install_cmd = (
-        f'powershell.exe -ExecutionPolicy Bypass -Command '
-        f'"& {{[scriptblock]::Create((irm https://raw.githubusercontent.com/heru223/rdp-fleet-bot/main/setup.ps1 -UseBasicParsing)).Invoke(\'{worker_name}\', \'{folder}\', \'{BOT_TOKEN}\', \'{ADMIN_CHAT_ID}\', \'\', $true)}}"'
-    )
-    rc_inst, out_inst, err_inst = execute_remote_windows_ssh(ip, password, install_cmd, timeout=120, user=user)
-
-    # 4. Ambil Node ID dari file status/uuid di RDP
-    time.sleep(3)
-    fetch_id_cmd = (
-        'powershell.exe -Command "'
-        'if (Test-Path \'$env:ProgramData\\EarnApp\\uuid\') { Get-Content \'$env:ProgramData\\EarnApp\\uuid\' } '
-        'elseif (Test-Path \'$env:ProgramFiles (x86)\\EarnApp\\uuid\') { Get-Content \'$env:ProgramFiles (x86)\\EarnApp\\uuid\' } '
-        'elseif (Test-Path \'$env:ProgramData\\EarnApp\\status.json\') { Get-Content \'$env:ProgramData\\EarnApp\\status.json\' }'
-        '"'
-    )
-    _, out_id, _ = execute_remote_windows_ssh(ip, password, fetch_id_cmd, timeout=15, user=user)
-
-    node_id = ""
-    m_nid = re.search(r'sdk-node-[a-zA-Z0-9_-]+', out_id)
-    if m_nid:
-        node_id = m_nid.group(0)
-
-    # Ambil info RAM
-    ram_cmd = 'powershell.exe -Command "$os = Get-CimInstance Win32_OperatingSystem; [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory)/1024).ToString() + \' MB / \' + [math]::Round($os.TotalVisibleMemorySize/1024).ToString() + \' MB\'"'
-    _, out_ram, _ = execute_remote_windows_ssh(ip, password, ram_cmd, timeout=10, user=user)
-    ram_str = out_ram.strip() if out_ram.strip() else "-"
-
-    claim_link = f"https://earnapp.com/r/{node_id}" if node_id else "<i>Sedang sinkronisasi... (Cek di tombol List Node ID dalam 1 menit)</i>"
-
-    # Simpan ke nodes.json
+    cmd_id = f"{command}_{int(time.time())}"
     with NODES_LOCK:
         nodes = load_nodes()
-        updated = False
+        found = False
+        target_name = target_id
         for n in nodes:
-            if n.get("ip") == ip or n.get("name") == worker_name:
-                n["ip"] = ip
-                n["name"] = worker_name
-                n["folder"] = folder
-                n["pwd"] = password
-                if node_id: n["uuid"] = node_id
-                if ram_str != "-": n["ram"] = ram_str
-                n["last_seen"] = int(time.time())
-                updated = True
+            if n.get("ip") == target_id or str(n.get("name", "")).lower() == target_id.lower():
+                PENDING_COMMANDS[n["ip"]] = {"command": command, "cmd_id": cmd_id, "time": time.time()}
+                PENDING_COMMANDS[str(n.get("name", "")).lower()] = {"command": command, "cmd_id": cmd_id, "time": time.time()}
+                target_name = n.get("name", n["ip"])
+                found = True
                 break
-        if not updated:
-            nodes.append({
-                "ip": ip,
-                "name": worker_name,
-                "folder": folder,
-                "pwd": password,
-                "uuid": node_id if node_id else "-",
-                "ram": ram_str,
-                "os": "Windows",
-                "last_seen": int(time.time())
-            })
-        save_nodes(nodes)
+        if not found:
+            PENDING_COMMANDS[target_id] = {"command": command, "cmd_id": cmd_id, "time": time.time()}
+    return cmd_id, target_name
 
-    success_msg = (
-        f"✅ <b>RDP [ {html.escape(worker_name)} ] BERHASIL DI-SETUP DARI TELEGRAM!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏷️ <b>Worker:</b> <b>{html.escape(worker_name)}</b> [📁 {html.escape(folder)}]\n"
-        f"🌐 <b>IP RDP:</b> <code>{html.escape(ip)}</code>\n"
-        f"💾 <b>RAM:</b> <code>{html.escape(ram_str)}</code>\n\n"
-        f"🆔 <b>Node ID:</b> <code>{html.escape(node_id if node_id else 'Sedang sinkronisasi...')}</code>\n"
-        f"🔗 <b>Claim Link:</b> {claim_link}\n\n"
-        f"🛡️ <b>Windows Defender:</b> 🟢 Whitelisted & PUA Disabled\n"
-        f"🔑 <b>Remote SSH:</b> 🟢 Port 22 Aktif (Bisa reboot via Tele!)\n"
-        f"🔄 <b>Auto-Reboot 24h:</b> 🟢 Terjadwal (04:00 AM)\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👉 <i>Klik tombol di bawah untuk langsung klaim ke akun EarnApp Anda!</i>"
-    )
-    return True, success_msg, node_id, claim_link
+# =========================================================================
+#  HTTP SERVER: STEALTH OUTBOUND AGENT RECEIVER & COMMAND DISPATCHER
+# =========================================================================
 
-def reboot_rdp_remote(n):
-    ip = n.get("ip")
-    pwd = n.get("pwd", "")
-    if not pwd:
-        return False, "Password RDP belum tersimpan di bot. Harap jalankan `/add <ip> <pwd>` terlebih dahulu."
-    rc, out, err = execute_remote_windows_ssh(ip, pwd, 'shutdown.exe /r /t 5 /f /c "Telegram remote reboot"', timeout=15)
-    if rc == 0:
-        return True, f"🔄 Perintah reboot berhasil dikirim ke RDP <b>{html.escape(n.get('name', ip))}</b> (<code>{ip}</code>)."
-    else:
-        return False, f"⚠️ Gagal reboot: {html.escape(err if err else 'SSH error')}"
+class StealthAgentHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
 
-def restart_earnapp_remote(n):
-    ip = n.get("ip")
-    pwd = n.get("pwd", "")
-    if not pwd:
-        return False, "Password RDP belum tersimpan di bot."
-    cmd = (
-        'powershell.exe -Command "'
-        'Stop-Process -Name *earnapp* -Force -ErrorAction SilentlyContinue; '
-        'Start-Sleep -Seconds 2; '
-        'Start-Process \'C:\\Program Files (x86)\\EarnApp\\earnapp.exe\' -ErrorAction SilentlyContinue; '
-        'Start-Process \'C:\\Program Files\\EarnApp\\earnapp.exe\' -ErrorAction SilentlyContinue'
-        '"'
-    )
-    rc, out, err = execute_remote_windows_ssh(ip, pwd, cmd, timeout=20)
-    if rc == 0:
-        return True, f"⚡ Proses EarnApp di RDP <b>{html.escape(n.get('name', ip))}</b> berhasil direstart!"
-    else:
-        return False, f"⚠️ Gagal restart EarnApp: {html.escape(err if err else 'SSH error')}"
+        try:
+            length = int(self.headers.get('content-length', 0))
+            raw = self.rfile.read(length).decode('utf-8')
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            data = {}
+
+        if path == "/heartbeat":
+            self.handle_heartbeat(data)
+        elif path == "/command_result":
+            self.handle_command_result(data)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def handle_heartbeat(self, data):
+        client_ip = data.get("ip") or self.client_address[0]
+        raw_name = data.get("name", f"RDP-{client_ip}")
+        folder = data.get("folder", "RDP").strip().capitalize()
+        uuid = data.get("uuid", "-")
+        ram = data.get("ram", "-")
+        status = data.get("status", "running")
+        uptime = data.get("uptime", "-")
+
+        assigned_name = raw_name
+
+        with NODES_LOCK:
+            nodes = load_nodes()
+            matched_node = None
+            for n in nodes:
+                if n.get("ip") == client_ip:
+                    matched_node = n
+                    break
+            
+            if matched_node:
+                # Update existing
+                matched_node["last_seen"] = int(time.time())
+                if ram != "-": matched_node["ram"] = ram
+                if uuid != "-" and "sdk-node" in uuid: matched_node["uuid"] = uuid
+                if status: matched_node["status"] = status
+                if uptime != "-": matched_node["uptime"] = uptime
+                assigned_name = matched_node.get("name", raw_name)
+            else:
+                # New RDP registering!
+                # Auto-name if default name
+                if not raw_name or raw_name.startswith("RDP-") or raw_name.startswith(f"{folder}-WIN-"):
+                    assigned_name = get_next_worker_name(folder)
+                else:
+                    assigned_name = raw_name
+
+                nodes.append({
+                    "ip": client_ip,
+                    "name": assigned_name,
+                    "folder": folder,
+                    "uuid": uuid,
+                    "ram": ram,
+                    "status": status,
+                    "uptime": uptime,
+                    "os": "Windows",
+                    "last_seen": int(time.time())
+                })
+            save_nodes(nodes)
+
+        # Check pending command
+        cmd_to_dispatch = None
+        cmd_id = None
+        if client_ip in PENDING_COMMANDS:
+            c = PENDING_COMMANDS.pop(client_ip)
+            cmd_to_dispatch, cmd_id = c["command"], c["cmd_id"]
+        elif assigned_name.lower() in PENDING_COMMANDS:
+            c = PENDING_COMMANDS.pop(assigned_name.lower())
+            cmd_to_dispatch, cmd_id = c["command"], c["cmd_id"]
+
+        response_obj = {"status": "ok", "assigned_name": assigned_name}
+        if cmd_to_dispatch:
+            response_obj["command"] = cmd_to_dispatch
+            response_obj["cmd_id"] = cmd_id
+
+        resp_bytes = json.dumps(response_obj).encode('utf-8')
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(resp_bytes)))
+        self.end_headers()
+        self.wfile.write(resp_bytes)
+
+    def handle_command_result(self, data):
+        ip = data.get("ip", "unknown")
+        name = data.get("name", ip)
+        cmd = data.get("cmd", "")
+        status = data.get("status", "")
+
+        cmd_indonesia = {
+            "reboot": "REBOOT WINDOWS",
+            "restart_earnapp": "RESTART EARNAPP"
+        }.get(cmd, cmd.upper())
+
+        notif_text = (
+            f"⚡ <b>[KOMANDO DIEKSEKUSI]</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🏷️ <b>Worker:</b> <b>{html.escape(name)}</b> (<code>{html.escape(ip)}</code>)\n"
+            f"⚙️ <b>Aksi:</b> <code>{cmd_indonesia}</code>\n"
+            f"📊 <b>Status:</b> <b>{html.escape(status.upper())}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━"
+        )
+        send_message(ADMIN_CHAT_ID, notif_text)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"status":"ok"}')
+
+    def log_message(self, format, *args):
+        return  # Silent logging
+
+def run_http_server():
+    try:
+        server = HTTPServer(("0.0.0.0", HTTP_PORT), StealthAgentHandler)
+        print(f"[HTTP SERVER] Stealth Agent Listener active on 0.0.0.0:{HTTP_PORT}")
+        server.serve_forever()
+    except Exception as e:
+        print(f"[HTTP SERVER ERROR] {e}")
 
 # =========================================================================
 #  TELEGRAM UI & DASHBOARD ENGINE
@@ -383,21 +355,23 @@ def render_dashboard(active_folder=None):
     nodes = load_nodes()
     now_ts = int(time.time())
     now_str = time.strftime("%H:%M:%S")
+    master_ip = get_master_public_ip()
 
     if not nodes:
+        setup_cmd = f"& ([scriptblock]::Create((irm https://raw.githubusercontent.com/heru223/rdp-fleet-bot/main/setup.ps1))) -MasterIP {master_ip} -Folder RDP"
         text = (
             "🚀 <b>EARNAPP WINDOWS RDP FLEET CONTROLLER</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "⚠️ <i>Belum ada Windows RDP yang terdaftar.</i>\n\n"
-            "<b>Cara Tambah RDP:</b>\n"
-            "1. <b>Otomatis dari Telegram:</b>\n"
-            "   Ketik: <code>/add &lt;ip&gt; &lt;password&gt; [folder]</code>\n"
-            "   Contoh: <code>/add 104.238.1.10 Rahasia123 nayla</code>\n\n"
-            "2. <b>Manual di RDP (PowerShell Admin):</b>\n"
-            "   <code>irm https://raw.githubusercontent.com/heru223/rdp-fleet-bot/main/setup.ps1 | iex</code>"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "🔒 <b>Arsitektur:</b> Outbound Stealth Agent (0 Port Terbuka)\n\n"
+            "⚠️ <i>Belum ada Windows RDP yang terhubung.</i>\n\n"
+            "<b>Cara Menghubungkan RDP Pertama Anda (5 Detik):</b>\n"
+            "1. Buka <b>PowerShell (Run as Admin)</b> di RDP Anda.\n"
+            "2. Paste perintah 1-klik di bawah lalu Enter:\n\n"
+            f"<code>{setup_cmd}</code>\n\n"
+            "3. Langsung tutup RDP! RDP akan otomatis muncul di sini."
         )
         markup = {"inline_keyboard": [
-            [{"text": "➕ Tambah / Setup RDP", "callback_data": "btn_add"}],
+            [{"text": "➕ Petunjuk Setup RDP", "callback_data": "btn_add"}],
             [{"text": "🔄 Refresh", "callback_data": "btn_refresh"}]
         ]}
         return text, markup
@@ -413,24 +387,26 @@ def render_dashboard(active_folder=None):
         f = get_node_folder(n)
         uuid = n.get("uuid", "-")
         ram = n.get("ram", "-")
+        uptime = n.get("uptime", "-")
         last_seen = n.get("last_seen", 0)
         
-        diff_min = int((now_ts - last_seen) / 60) if last_seen > 0 else 999
-        is_online = diff_min <= 30
+        diff_sec = now_ts - last_seen if last_seen > 0 else 9999
+        is_online = diff_sec <= 60  # Heartbeat tiap 15s
         if is_online: online_count += 1
 
         f_entry = folders_data.setdefault(f, {"nodes": [], "online": 0})
         f_entry["nodes"].append(n)
         if is_online: f_entry["online"] += 1
 
-        status_emoji = "🟢" if is_online else "🟡" if diff_min <= 120 else "🔴"
-        seen_str = "Online" if diff_min <= 5 else f"{diff_min}m lalu" if diff_min < 60 else f"{int(diff_min/60)}j lalu"
+        status_emoji = "🟢" if is_online else "🟡" if diff_sec <= 300 else "🔴"
+        seen_str = "Online" if diff_sec <= 30 else f"{int(diff_sec/60)}m lalu" if diff_sec < 3600 else f"{int(diff_sec/3600)}j lalu"
         
         claim_link = f"https://earnapp.com/r/{uuid}" if uuid != "-" and "sdk-node" in uuid else "<i>Belum klaim</i>"
         
         line = (
             f"{status_emoji} <b>{html.escape(str(name))}</b> (<code>{html.escape(str(ip))}</code>)\n"
             f"   ├ 💾 RAM: <code>{html.escape(str(ram))}</code> | 🕒 Seen: <i>{seen_str}</i>\n"
+            f"   ├ ⏱️ Uptime: <code>{html.escape(str(uptime))}</code>\n"
             f"   ├ 🆔 <code>{html.escape(str(uuid[:22]))}...</code>\n"
             f"   └ 🔗 {claim_link}"
         )
@@ -454,7 +430,8 @@ def render_dashboard(active_folder=None):
             f"📁 <b>FOLDER RDP: {html.escape(matched_folder.upper())}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"🖥️ <b>Workers:</b> {f_info['online']}/{len(f_info['nodes'])} Online\n"
-            f"🕒 <b>Update:</b> <code>{now_str}</code> | 🛡️ <b>24/7 Keep-Alive:</b> 🟢\n"
+            f"🔒 <b>Keamanan:</b> 0 Port Terbuka (Stealth Agent 15s)\n"
+            f"🕒 <b>Update:</b> <code>{now_str}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
         )
         text = header + "\n\n".join(f_lines)
@@ -465,12 +442,12 @@ def render_dashboard(active_folder=None):
             [{"text": "📋 List Node ID", "callback_data": "btn_ids"}, {"text": "🗑️ Hapus RDP", "callback_data": "btn_del_menu"}]
         ]
         
-        # Tambah baris aksi cepat jika ada node di folder ini
+        # Quick action reboot buttons
         if f_nodes:
-            action_row = []
+            reb_row = []
             for item in f_nodes[:3]:
-                action_row.append({"text": f"🔄 Reboot {item.get('name')}", "callback_data": f"reb_{item.get('ip')}"})
-            buttons.insert(1, action_row)
+                reb_row.append({"text": f"🔄 Reboot {item.get('name')}", "callback_data": f"reb_{item.get('ip')}"})
+            buttons.insert(1, reb_row)
 
         return text, {"inline_keyboard": buttons}
 
@@ -480,7 +457,8 @@ def render_dashboard(active_folder=None):
             f"⚡ <b>EARNAPP WINDOWS RDP DASHBOARD (ALL)</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"🖥️ <b>Total RDP:</b> {online_count}/{total_nodes} Online\n"
-            f"🕒 <b>Update:</b> <code>{now_str}</code> | 🛡️ <b>24/7 Keep-Alive:</b> 🟢\n"
+            f"🔒 <b>Port Terbuka:</b> 0 Port (100% Aman)\n"
+            f"🕒 <b>Update:</b> <code>{now_str}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
         )
         text = header + "\n\n".join([l for (f, l, n) in node_lines])
@@ -508,7 +486,8 @@ def render_dashboard(active_folder=None):
             f"⚡ <b>EARNAPP WINDOWS RDP CONTROLLER</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"🖥️ <b>Total RDP:</b> {online_count}/{total_nodes} Online\n"
-            f"🕒 <b>Update:</b> <code>{now_str}</code> | 🛡️ <b>24/7 Keep-Alive:</b> 🟢\n"
+            f"🔒 <b>Arsitektur:</b> Outbound Stealth Agent (0 Port Terbuka)\n"
+            f"🕒 <b>Update:</b> <code>{now_str}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📁 <b>GROUP & FOLDER OVERVIEW:</b>\n\n"
         )
@@ -546,32 +525,7 @@ def handle_telegram_message(msg):
             return
 
         text_lower = text.lower()
-
-        # Check pending interactive states
-        if chat_id in USER_STATES:
-            state = USER_STATES[chat_id]
-            if state.get("step") == "WAIT_ADD_INPUT":
-                del USER_STATES[chat_id]
-                parts = text.split()
-                if len(parts) >= 2:
-                    ip = parts[0].strip()
-                    pwd = parts[1].strip()
-                    folder = state.get("target_folder") or (parts[2].strip().capitalize() if len(parts) >= 3 else "RDP")
-                    name = parts[3].strip() if len(parts) >= 4 else None
-                    
-                    wait_msg = send_message(chat_id, f"⏳ Sedang menghubungkan ke RDP <code>{html.escape(ip)}</code> dan menjalankan konfigurasi otomatis... Mohon tunggu ~20-30 detik...")
-                    def _run_add():
-                        ok, res_text, nid, clink = setup_rdp_remote(ip, pwd, folder=folder, name=name)
-                        kb = []
-                        if nid and "sdk-node" in nid:
-                            kb.append([{"text": "🔗 Klaim Akun EarnApp", "url": f"https://earnapp.com/r/{nid}"}])
-                        kb.append([{"text": "📊 Buka Dashboard", "callback_data": "btn_refresh"}])
-                        send_message(chat_id, res_text, reply_markup={"inline_keyboard": kb})
-                    threading.Thread(target=_run_add, daemon=True).start()
-                    return
-                else:
-                    send_message(chat_id, "⚠️ Format salah. Gunakan: <code>&lt;ip&gt; &lt;password&gt; [folder] [name]</code>")
-                    return
+        master_ip = get_master_public_ip()
 
         if any(text.startswith(cmd) for cmd in ["/start", "/menu", "/status", "/nodes", "/dashboard"]) or text_lower == "status rdp fleet":
             dash_text, markup = render_dashboard()
@@ -605,74 +559,55 @@ def handle_telegram_message(msg):
                 LAST_DASHBOARD_MSG["view"] = f_target
         elif text.startswith("/add") or text_lower == "tambah / setup rdp" or text_lower == "tambah rdp":
             parts = text.split()
-            if len(parts) >= 3:
-                ip = parts[1].strip()
-                pwd = parts[2].strip()
-                folder = parts[3].strip().capitalize() if len(parts) >= 4 else "RDP"
-                name = parts[4].strip() if len(parts) >= 5 else None
+            folder_target = parts[1].strip().capitalize() if len(parts) >= 2 else "RDP"
+            next_name = get_next_worker_name(folder_target)
+            setup_cmd = f"& ([scriptblock]::Create((irm https://raw.githubusercontent.com/heru223/rdp-fleet-bot/main/setup.ps1))) -MasterIP {master_ip} -Folder {folder_target}"
 
-                send_message(chat_id, f"⏳ <b>Memulai Remote Setup RDP:</b> <code>{html.escape(ip)}</code> ke folder <b>{html.escape(folder)}</b>...\nMohon tunggu ~20-30 detik...")
-                def _run_bg():
-                    ok, res_text, nid, clink = setup_rdp_remote(ip, pwd, folder=folder, name=name)
-                    kb = []
-                    if nid and "sdk-node" in nid:
-                        kb.append([{"text": "🔗 Klaim Akun EarnApp", "url": f"https://earnapp.com/r/{nid}"}])
-                    kb.append([{"text": "📊 Buka Dashboard", "callback_data": "btn_refresh"}])
-                    send_message(chat_id, res_text, reply_markup={"inline_keyboard": kb})
-                threading.Thread(target=_run_bg, daemon=True).start()
-            else:
-                USER_STATES[chat_id] = {"step": "WAIT_ADD_INPUT", "target_folder": None}
-                setup_cmd = "irm https://raw.githubusercontent.com/heru223/rdp-fleet-bot/main/setup.ps1 | iex"
-                msg_text = (
-                    "➕ <b>TAMBAH / SETUP WINDOWS RDP:</b>\n"
-                    "━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "⚡ <b>Metode 1: Otomatis dari Telegram (Tanpa Buka Layar RDP)</b>\n"
-                    "Kirimkan IP dan Password RDP dengan format:\n"
-                    "<code>/add &lt;ip&gt; &lt;password&gt; [folder] [name]</code>\n\n"
-                    "Contoh:\n"
-                    "<code>/add 104.238.1.10 Rahasia123 nayla</code>\n"
-                    "<i>(Nama worker otomatis berurut: nayla-1, nayla-2, dst.)</i>\n\n"
-                    "━━━━━━━━━━━━━━━━━━━━━\n"
-                    "📋 <b>Metode 2: Manual 1-Klik di RDP (Jika SSH Port 22 ditutup)</b>\n"
-                    "Buka PowerShell (Run as Admin) di RDP dan jalankan:\n"
-                    f"<code>{setup_cmd}</code>"
-                )
-                markup = {"inline_keyboard": [
-                    [{"text": "🔙 Batal / Dashboard", "callback_data": "btn_refresh"}]
-                ]}
-                send_message(chat_id, msg_text, reply_markup=markup)
+            msg_text = (
+                f"➕ <b>SETUP RDP KE FOLDER {html.escape(folder_target.upper())} (CARA 2: STEALTH):</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔒 <b>Keamanan 100% Anti-Curiga:</b>\n"
+                f"• Port 22 tetap <b>MATI TOTAL</b>.\n"
+                f"• 0 Port Masuk dibuka (Penyedia RDP tidak akan tahu!).\n"
+                f"• Nama worker otomatis urut: <b>{html.escape(next_name)}</b>\n\n"
+                f"⚡ <b>Langkah Cepat (Hanya 5 Detik):</b>\n"
+                f"1. Buka RDP Anda.\n"
+                f"2. Buka <b>PowerShell (Run as Administrator)</b>.\n"
+                f"3. Copy & paste perintah 1-baris berikut, lalu tekan Enter:\n\n"
+                f"<code>{setup_cmd}</code>\n\n"
+                f"4. <b>Langsung tutup RDP!</b> Anda tidak perlu menunggu di layarnya.\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"✨ <i>RDP otomatis mengirim link klaim ke sini dan siap dikontrol via Telegram!</i>"
+            )
+            markup = {"inline_keyboard": [
+                [{"text": "🔙 Batal / Dashboard", "callback_data": "btn_refresh"}]
+            ]}
+            send_message(chat_id, msg_text, reply_markup=markup)
         elif text.startswith("/reboot"):
             parts = text.split()
             if len(parts) >= 2:
                 target = parts[1].strip()
-                nodes = load_nodes()
-                matched = [n for n in nodes if n.get("ip") == target or str(n.get("name", "")).lower() == target.lower()]
-                if matched:
-                    send_message(chat_id, f"⏳ Mengirim sinyal reboot ke RDP <b>{html.escape(matched[0].get('name'))}</b>...")
-                    def _do_reb():
-                        ok, res = reboot_rdp_remote(matched[0])
-                        send_message(chat_id, res)
-                    threading.Thread(target=_do_reb, daemon=True).start()
-                else:
-                    send_message(chat_id, f"⚠️ RDP <code>{html.escape(target)}</code> tidak ditemukan di daftar.")
+                cmd_id, target_name = queue_command(target, "reboot")
+                send_message(
+                    chat_id,
+                    f"⏳ <b>Perintah REBOOT dikirim ke antrean RDP [ {html.escape(target_name)} ]!</b>\n\n"
+                    f"RDP akan otomatis restart dalam <b>~15 detik</b> saat sinyal heartbeat berikutnya diterima.\n"
+                    f"<i>(0 Port Terbuka, 100% Aman & Stealth).</i>"
+                )
             else:
-                send_message(chat_id, "Gunakan: <code>/reboot &lt;ip atau nama&gt;</code>")
+                send_message(chat_id, "Gunakan: <code>/reboot &lt;nama_atau_ip&gt;</code> (Contoh: <code>/reboot nayla-1</code>)")
         elif text.startswith("/restart"):
             parts = text.split()
             if len(parts) >= 2:
                 target = parts[1].strip()
-                nodes = load_nodes()
-                matched = [n for n in nodes if n.get("ip") == target or str(n.get("name", "")).lower() == target.lower()]
-                if matched:
-                    send_message(chat_id, f"⏳ Mengirim sinyal restart EarnApp ke <b>{html.escape(matched[0].get('name'))}</b>...")
-                    def _do_rst():
-                        ok, res = restart_earnapp_remote(matched[0])
-                        send_message(chat_id, res)
-                    threading.Thread(target=_do_rst, daemon=True).start()
-                else:
-                    send_message(chat_id, f"⚠️ RDP <code>{html.escape(target)}</code> tidak ditemukan di daftar.")
+                cmd_id, target_name = queue_command(target, "restart_earnapp")
+                send_message(
+                    chat_id,
+                    f"⏳ <b>Perintah RESTART EARNAPP dikirim ke antrean RDP [ {html.escape(target_name)} ]!</b>\n\n"
+                    f"Proses EarnApp akan direstart dalam <b>~15 detik</b>."
+                )
             else:
-                send_message(chat_id, "Gunakan: <code>/restart &lt;ip atau nama&gt;</code>")
+                send_message(chat_id, "Gunakan: <code>/restart &lt;nama_atau_ip&gt;</code> (Contoh: <code>/restart nayla-1</code>)")
         elif text.startswith("/id") or text_lower == "list node id" or text_lower == "node id":
             nodes = load_nodes()
             lines = ["📋 <b>EARNAPP RDP NODE IDs & CLAIM URL</b>\n━━━━━━━━━━━━━━━━━━━━━"]
@@ -729,17 +664,16 @@ def handle_telegram_message(msg):
                 else:
                     send_message(chat_id, f"⚠️ RDP tidak ditemukan.")
             else:
-                # Buka menu tombol hapus
                 nodes = load_nodes()
                 buttons = [[{"text": f"🗑️ {n.get('name')} ({n.get('ip')})", "callback_data": f"del_{n.get('ip')}"}] for n in nodes]
                 buttons.append([{"text": "🔙 Kembali ke Dashboard", "callback_data": "btn_refresh"}])
                 send_message(chat_id, "🗑️ <b>PILIH RDP YANG AKAN DIHAPUS:</b>", reply_markup={"inline_keyboard": buttons})
         elif text.startswith("/help") or "help" in text_lower:
             help_text = (
-                "📖 <b>PANDUAN BOT RDP FLEET CONTROLLER</b>\n\n"
+                "📖 <b>PANDUAN BOT RDP FLEET CONTROLLER (STEALTH AGENT)</b>\n\n"
                 "• <code>/start</code> - Buka ringkasan folder dashboard RDP\n"
-                "• <code>/add &lt;ip&gt; &lt;pwd&gt; [folder] [name]</code> - Setup RDP otomatis via SSH tanpa buka layar!\n"
-                "• <code>/reboot &lt;nama/ip&gt;</code> - Restart Windows RDP secara remote\n"
+                "• <code>/add [folder]</code> - Dapatkan perintah 1-klik untuk hubungkan RDP\n"
+                "• <code>/reboot &lt;nama/ip&gt;</code> - Restart Windows RDP secara remote (15s)\n"
                 "• <code>/restart &lt;nama/ip&gt;</code> - Restart proses EarnApp secara remote\n"
                 "• <code>/folder &lt;nama&gt;</code> - Buka folder tertentu (misal: Singapore)\n"
                 "• <code>/all</code> - Tampilkan seluruh RDP\n"
@@ -762,6 +696,8 @@ def handle_telegram_callback(cb):
         chat_id = cb.get("message", {}).get("chat", {}).get("id")
         msg_id = cb.get("message", {}).get("message_id")
         data = cb.get("data", "")
+        master_ip = get_master_public_ip()
+
         if int(chat_id) != ADMIN_CHAT_ID:
             answer_callback(cb_id, "Akses ditolak.", show_alert=True)
             return
@@ -807,46 +743,37 @@ def handle_telegram_callback(cb):
             target_f = data.replace("fld_add_", "")
             answer_callback(cb_id)
             next_name = get_next_worker_name(target_f)
-            USER_STATES[chat_id] = {"step": "WAIT_ADD_INPUT", "target_folder": target_f}
+            setup_cmd = f"& ([scriptblock]::Create((irm https://raw.githubusercontent.com/heru223/rdp-fleet-bot/main/setup.ps1))) -MasterIP {master_ip} -Folder {target_f}"
             msg_text = (
                 f"➕ <b>TAMBAH RDP KE FOLDER {html.escape(target_f.upper())}:</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Nama worker berikutnya akan otomatis: <b>{html.escape(next_name)}</b>\n\n"
-                f"Kirimkan IP dan Password RDP Anda sekarang dengan format:\n"
-                f"<code>&lt;ip&gt; &lt;password&gt;</code>\n\n"
-                f"Contoh:\n"
-                f"<code>104.238.1.10 Rahasia123</code>"
+                f"Worker berikutnya otomatis dinamai: <b>{html.escape(next_name)}</b>\n"
+                f"🔒 <b>0 Port Terbuka</b> (Penyedia RDP tidak akan tahu!)\n\n"
+                f"1. Buka <b>PowerShell (Admin)</b> di RDP baru Anda.\n"
+                f"2. Paste perintah 1-klik ini:\n\n"
+                f"<code>{setup_cmd}</code>\n\n"
+                f"3. Langsung tutup RDP! RDP akan langsung muncul di folder ini."
             )
             edit_message(chat_id, msg_id, msg_text, {"inline_keyboard": [[{"text": "🔙 Batal", "callback_data": f"fld_view_{target_f}"}]]})
         elif data.startswith("reb_"):
             target_ip = data.replace("reb_", "")
-            nodes = load_nodes()
-            matched = [n for n in nodes if n.get("ip") == target_ip]
-            if matched:
-                answer_callback(cb_id, f"Mengirim perintah reboot ke {matched[0].get('name')}...", show_alert=True)
-                def _bg_reb():
-                    ok, res = reboot_rdp_remote(matched[0])
-                    send_message(chat_id, res)
-                threading.Thread(target=_bg_reb, daemon=True).start()
-            else:
-                answer_callback(cb_id, "RDP tidak ditemukan.", show_alert=True)
+            cmd_id, target_name = queue_command(target_ip, "reboot")
+            answer_callback(cb_id, f"Perintah reboot dikirim ke {target_name}. RDP akan restart dalam ~15s!", show_alert=True)
         elif data == "btn_add":
             answer_callback(cb_id)
-            setup_cmd = "irm https://raw.githubusercontent.com/heru223/rdp-fleet-bot/main/setup.ps1 | iex"
+            setup_cmd = f"& ([scriptblock]::Create((irm https://raw.githubusercontent.com/heru223/rdp-fleet-bot/main/setup.ps1))) -MasterIP {master_ip} -Folder RDP"
             msg_text = (
-                "➕ <b>TAMBAH / SETUP WINDOWS RDP:</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━\n\n"
-                "⚡ <b>Metode 1: Otomatis dari Telegram (Tanpa Buka RDP)</b>\n"
-                "Gunakan perintah:\n"
-                "<code>/add &lt;ip&gt; &lt;password&gt; [folder]</code>\n\n"
-                "Contoh:\n"
-                "<code>/add 104.238.1.10 Rahasia123 nayla</code>\n"
-                "<i>(Nama worker otomatis berurut: nayla-1, nayla-2, dst.)</i>\n\n"
+                "➕ <b>SETUP 1-KLIK WINDOWS RDP (STEALTH AGENT):</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━\n"
-                "📋 <b>Metode 2: Manual 1-Klik di RDP (Jika SSH Port 22 ditutup)</b>\n"
-                "Buka <b>PowerShell (Run as Admin)</b> di RDP dan jalankan:\n\n"
+                "🔒 <b>Keamanan 100% Anti-Curiga:</b>\n"
+                "• Port 22 tetap <b>MATI TOTAL</b>.\n"
+                "• 0 Port Masuk yang dibuka di RDP Anda.\n"
+                "• Menggunakan Outbound Agent (Trafik seperti web browsing biasa).\n\n"
+                "⚡ <b>Langkah Cepat (Hanya 5 Detik):</b>\n"
+                "1. Buka <b>PowerShell (Run as Admin)</b> di RDP Anda.\n"
+                "2. Paste perintah otomatis berikut lalu Enter:\n\n"
                 f"<code>{setup_cmd}</code>\n\n"
-                "<i>Script otomatis membuka OpenSSH & Defender whitelist, sehingga seterusnya RDP bisa dikontrol dari Telegram!</i>"
+                "3. Langsung tutup RDP! Script akan otomatis mendaftarkan RDP ke bot ini."
             )
             edit_message(chat_id, msg_id, msg_text, {"inline_keyboard": [[{"text": "🔙 Kembali ke Dashboard", "callback_data": "btn_refresh"}]]})
         elif data == "btn_ids":
@@ -876,68 +803,8 @@ def handle_telegram_callback(cb):
         print(f"[CB ERROR] {e}")
 
 # =========================================================================
-#  HTTP REGISTRATION & HEARTBEAT RECEIVER (Port 9090)
+#  TELEGRAM POLLING DAEMON
 # =========================================================================
-
-class RDPRegistrationHandler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        try:
-            length = int(self.headers.get('content-length', 0))
-            raw = self.rfile.read(length).decode('utf-8')
-            data = json.loads(raw)
-            
-            ip = data.get("ip", self.client_address[0])
-            name = data.get("name", f"RDP-{ip}")
-            folder = data.get("folder", "RDP").strip().capitalize()
-            uuid = data.get("uuid", "-")
-            ram = data.get("ram", "-")
-            os_name = data.get("os", "Windows")
-
-            with NODES_LOCK:
-                nodes = load_nodes()
-                found = False
-                for n in nodes:
-                    if n.get("ip") == ip or n.get("name") == name:
-                        n["ip"] = ip
-                        n["name"] = name
-                        n["folder"] = folder
-                        n["uuid"] = uuid
-                        n["ram"] = ram
-                        n["os"] = os_name
-                        n["last_seen"] = int(time.time())
-                        found = True
-                        break
-                if not found:
-                    nodes.append({
-                        "ip": ip,
-                        "name": name,
-                        "folder": folder,
-                        "pwd": "",
-                        "uuid": uuid,
-                        "ram": ram,
-                        "os": os_name,
-                        "last_seen": int(time.time())
-                    })
-                save_nodes(nodes)
-
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"status":"ok"}')
-        except Exception as e:
-            self.send_response(500)
-            self.end_headers()
-            self.wfile.write(str(e).encode('utf-8'))
-
-    def log_message(self, format, *args):
-        return  # Silent logging
-
-def run_http_server():
-    try:
-        server = HTTPServer(("0.0.0.0", HTTP_PORT), RDPRegistrationHandler)
-        server.serve_forever()
-    except Exception as e:
-        print(f"[HTTP SERVER NOTICE] {e}")
 
 def telegram_poller():
     offset = 0
@@ -949,11 +816,12 @@ def telegram_poller():
     except Exception: pass
 
     try:
+        master_ip = get_master_public_ip()
         startup_msg = (
             "🤖 <b>EarnApp Windows RDP Master Bot Aktif!</b>\n\n"
-            "✅ <b>Dedicated RDP Controller:</b> Running\n"
-            "🛡️ <b>Remote SSH Management:</b> Ready\n"
-            "⚡ <b>Auto-Naming by Folder:</b> Ready\n\n"
+            "✅ <b>Arsitektur:</b> Outbound Stealth Agent (0 Port Terbuka)\n"
+            f"🌐 <b>Master IP:</b> <code>{master_ip}</code>\n"
+            "🛡️ <b>Remote Reboot & Restart:</b> Ready (Polling 15s)\n\n"
             "Ketik <code>/start</code> untuk membuka dashboard armada RDP Anda."
         )
         send_message(ADMIN_CHAT_ID, startup_msg, reply_markup=MAIN_REPLY_KEYBOARD)
