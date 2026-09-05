@@ -78,8 +78,24 @@ $ramStr = "$usedRamMb MB / $totalRamMb MB ($([math]::Round(($usedRamMb/$totalRam
 $hostname = $env:COMPUTERNAME
 
 if ([string]::IsNullOrWhiteSpace($WorkerName)) {
-    $WorkerName = "RDP-$hostname"
-    Write-Host "🏷️ Nama Worker default: $WorkerName" -ForegroundColor Cyan
+    $defaultName = "RDP-$hostname"
+    Write-Host "`n🏷️ Masukkan Nama Worker RDP (Tekan [ENTER] untuk default: $defaultName): " -NoNewline -ForegroundColor Cyan
+    $inputName = Read-Host
+    if (-not [string]::IsNullOrWhiteSpace($inputName)) {
+        $WorkerName = $inputName.Trim()
+    } else {
+        $WorkerName = $defaultName
+    }
+    Write-Host "   Worker Name diset ke: $WorkerName" -ForegroundColor Green
+
+    Write-Host "📁 Masukkan Nama Folder / Grup (Tekan [ENTER] untuk default: RDP): " -NoNewline -ForegroundColor Cyan
+    $inputFolder = Read-Host
+    if (-not [string]::IsNullOrWhiteSpace($inputFolder)) {
+        $Folder = (Get-Culture).TextInfo.ToTitleCase($inputFolder.Trim().ToLower())
+    } else {
+        $Folder = "RDP"
+    }
+    Write-Host "   Folder diset ke: $Folder" -ForegroundColor Green
 }
 
 # 3. Pengecekan EarnApp (Sudah Ada atau Belum)
