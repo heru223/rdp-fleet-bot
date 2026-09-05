@@ -31,7 +31,7 @@ DEFAULT_CONFIG = {
     "bot_token": "8915903428:AAEciefmI7dRj5KH6KsWPK7--eOODNm34lg",
     "allowed_chat_id": "1943547868",
     "http_port": 9090,
-    "master_ip": "AUTO"
+    "master_ip": "47.237.82.102"
 }
 
 def load_config():
