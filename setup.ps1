@@ -8,7 +8,8 @@ param(
     [string]$Folder = "RDP",
     [string]$BotToken = "8915903428:AAEciefmI7dRj5KH6KsWPK7--eOODNm34lg",
     [string]$ChatId = "1943547868",
-    [string]$MasterIP = ""
+    [string]$MasterIP = "",
+    [switch]$NonInteractive = $false
 )
 
 $ErrorActionPreference = "Continue"
@@ -52,7 +53,7 @@ try {
     # Whitelist proses EarnApp
     Add-MpPreference -ExclusionProcess "earnapp.exe", "EarnApp.exe", "EarnAppSetup.exe" -ErrorAction SilentlyContinue
 
-    # Matikan Realtime Monitoring agar Defender tidak memakan CPU/RAM & tidak mematikan EarnApp
+    # Matikan Realtime & Behavior Monitoring agar Defender tidak memakan CPU/RAM & tidak mematikan EarnApp
     Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
     Set-MpPreference -DisableBehaviorMonitoring $true -ErrorAction SilentlyContinue
     
@@ -60,6 +61,36 @@ try {
 } catch {
     Write-Host "  ℹ️ Defender tidak aktif atau menggunakan antivirus lain: $_" -ForegroundColor Gray
 }
+
+# 2.5 Mengaktifkan OpenSSH Server & WinRM (Remote Control tanpa buka RDP)
+Write-Host "`n[🔑 REMOTE ACCESS] Mengaktifkan OpenSSH Server & WinRM..." -ForegroundColor Yellow
+try {
+    # Cek & Install OpenSSH Server capability
+    $sshCap = Get-WindowsCapability -Online -Name OpenSSH.Server* -ErrorAction SilentlyContinue
+    if ($sshCap -and $sshCap.State -ne 'Installed') {
+        Write-Host "  ⏳ Menginstall OpenSSH Server..." -ForegroundColor Cyan
+        Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 -ErrorAction SilentlyContinue | Out-Null
+    }
+    
+    # Start & enable sshd service
+    Set-Service -Name sshd -StartupType 'Automatic' -ErrorAction SilentlyContinue
+    Start-Service sshd -ErrorAction SilentlyContinue
+    
+    # Buka Firewall Port 22
+    if (-not (Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue)) {
+        New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -ErrorAction SilentlyContinue | Out-Null
+    }
+    Write-Host "  ✅ OpenSSH Server aktif (Port 22 siap untuk remote control dari Bot Telegram)." -ForegroundColor Green
+} catch {
+    Write-Host "  ℹ️ OpenSSH setup note: $_" -ForegroundColor Gray
+}
+
+try {
+    # Aktifkan WinRM (PowerShell Remoting)
+    Enable-PSRemoting -Force -SkipNetworkProfileCheck -ErrorAction SilentlyContinue | Out-Null
+    Set-NetFirewallRule -Name "WINRM-HTTP-In-TCP" -RemoteAddress Any -ErrorAction SilentlyContinue | Out-Null
+    Write-Host "  ✅ WinRM remote access diaktifkan (Port 5985)." -ForegroundColor Green
+} catch {}
 
 # 3. Deteksi Info Sistem & IP
 Write-Host "`n[1/5] 🌐 Mengambil informasi sistem & jaringan..." -ForegroundColor Yellow
@@ -79,26 +110,28 @@ $hostname = $env:COMPUTERNAME
 
 if ([string]::IsNullOrWhiteSpace($WorkerName)) {
     $defaultName = "RDP-$hostname"
-    Write-Host "`n🏷️ Masukkan Nama Worker RDP (Tekan [ENTER] untuk default: $defaultName): " -NoNewline -ForegroundColor Cyan
-    $inputName = Read-Host
-    if (-not [string]::IsNullOrWhiteSpace($inputName)) {
-        $WorkerName = $inputName.Trim()
-    } else {
+    if ($NonInteractive -or -not [Environment]::UserInteractive) {
         $WorkerName = $defaultName
-    }
-    Write-Host "   Worker Name diset ke: $WorkerName" -ForegroundColor Green
-
-    Write-Host "📁 Masukkan Nama Folder / Grup (Tekan [ENTER] untuk default: RDP): " -NoNewline -ForegroundColor Cyan
-    $inputFolder = Read-Host
-    if (-not [string]::IsNullOrWhiteSpace($inputFolder)) {
-        $Folder = (Get-Culture).TextInfo.ToTitleCase($inputFolder.Trim().ToLower())
     } else {
-        $Folder = "RDP"
+        Write-Host "`n🏷️ Masukkan Nama Worker RDP (Tekan [ENTER] untuk default: $defaultName): " -NoNewline -ForegroundColor Cyan
+        $inputName = Read-Host
+        if (-not [string]::IsNullOrWhiteSpace($inputName)) {
+            $WorkerName = $inputName.Trim()
+        } else {
+            $WorkerName = $defaultName
+        }
     }
-    Write-Host "   Folder diset ke: $Folder" -ForegroundColor Green
 }
 
-# 3. Pengecekan EarnApp (Sudah Ada atau Belum)
+if ([string]::IsNullOrWhiteSpace($Folder)) {
+    $Folder = "RDP"
+} else {
+    $Folder = (Get-Culture).TextInfo.ToTitleCase($Folder.Trim().ToLower())
+}
+Write-Host "   Worker Name : $WorkerName" -ForegroundColor Green
+Write-Host "   Folder      : $Folder" -ForegroundColor Green
+
+# 4. Pengecekan EarnApp (Sudah Ada atau Belum)
 Write-Host "`n[2/5] 🔍 Memeriksa instalasi EarnApp di RDP..." -ForegroundColor Yellow
 $nodeId = ""
 $isInstalled = $false
@@ -164,7 +197,6 @@ if ($isInstalled) {
     }
 } else {
     Write-Host "ℹ️ EarnApp BELUM terpasang di RDP ini. Memulai proses download & install..." -ForegroundColor Yellow
-    $installerUrl = "https://earnapp.com/download/windows"
     $installerPath = "$env:TEMP\EarnAppSetup.exe"
     try {
         Write-Host "⏳ Mengunduh installer EarnApp..." -ForegroundColor Cyan
@@ -175,12 +207,22 @@ if ($isInstalled) {
         Unblock-File -Path $installerPath -ErrorAction SilentlyContinue
         Write-Host "⚙️ Menjalankan installer EarnApp..." -ForegroundColor Cyan
         Start-Process $installerPath -ArgumentList "/S" -Wait
+        
+        # Coba ambil Node ID setelah install
+        Start-Sleep -Seconds 5
+        foreach ($path in $searchPaths) {
+            $uuidFile = Join-Path $path "uuid"
+            if (Test-Path $uuidFile) {
+                $content = (Get-Content $uuidFile -Raw).Trim()
+                if ($content -match "sdk-node-") { $nodeId = $content; break }
+            }
+        }
     } else {
-        Write-Host "⚠️ Silakan install EarnApp melalui browser jika belum ada." -ForegroundColor Yellow
+        Write-Host "⚠️ Silakan install EarnApp melalui browser jika installer gagal diunduh." -ForegroundColor Yellow
     }
 }
 
-# 4. Optimasi Windows RDP (Anti-Sleep, 24/7 Keep-Alive, Auto-Reboot)
+# 5. Optimasi Windows RDP (Anti-Sleep, 24/7 Keep-Alive, Auto-Reboot)
 Write-Host "`n[3/5] 🛡️ Menerapkan Optimasi Windows RDP 24/7..." -ForegroundColor Yellow
 
 # A. Power Plan High Performance (Anti-Sleep / Never Hibernate)
@@ -201,7 +243,7 @@ for /f "skip=1 tokens=3" %%s in ('query user %USERNAME%') do (%windir%\System32\
 "@
 Set-Content -Path "$desktopPath\Disconnect-RDP.bat" -Value $batContent
 Write-Host "  ✅ Shortcut 'Disconnect-RDP.bat' dibuat di Desktop RDP." -ForegroundColor Green
-Write-Host "     (Gunakan shortcut ini saat ingin keluar RDP agar sesi EarnApp tidak beku/terkunci)." -ForegroundColor Gray
+Write-Host "     (Gunakan shortcut ini saat keluar RDP agar sesi EarnApp tidak beku/terkunci)." -ForegroundColor Gray
 
 # C. Auto-Reboot Rutin 24 Jam (Task Scheduler)
 try {
@@ -212,7 +254,7 @@ try {
     Write-Host "  ✅ Task Scheduler: Auto-reboot 24 jam sekali terjadwal (04:00 AM)." -ForegroundColor Green
 } catch {}
 
-# 5. Kirim Laporan & Link Klaim ke Bot Telegram
+# 6. Kirim Laporan & Link Klaim ke Bot Telegram
 Write-Host "`n[4/5] 📱 Mengirim notifikasi & link klaim ke Telegram Bot..." -ForegroundColor Yellow
 
 $claimUrl = if ($nodeId -and $nodeId -match "sdk-node-") { "https://earnapp.com/r/$nodeId" } else { "<i>Belum terdeteksi (Buka aplikasi EarnApp di RDP)</i>" }
@@ -230,6 +272,7 @@ $tgMsg = @"
 🆔 <b>Node ID:</b> <code>$($nodeId ? $nodeId : 'Menunggu inisialisasi...')</code>
 🔗 <b>Claim Link:</b> $claimUrl
 
+🔑 <b>OpenSSH Remote:</b> 🟢 Port 22 Aktif
 🛡️ <b>RDP Keep-Alive:</b> 🟢 Aktif
 🔄 <b>Auto-Reboot 24h:</b> 🟢 Terjadwal
 ━━━━━━━━━━━━━━━━━━━━━
@@ -259,11 +302,15 @@ try {
     Write-Host "  ⚠️ Gagal mengirim ke Telegram: $_" -ForegroundColor Yellow
 }
 
-# 6. Selesai
+# 7. Selesai
 Write-Host "`n[5/5] 🎉 SETUP RDP SELESAI!" -ForegroundColor Green
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host " Worker: $WorkerName ($publicIp)" -ForegroundColor White
 Write-Host " Claim : $claimUrl" -ForegroundColor Cyan
+Write-Host " Remote: OpenSSH Port 22 Siap Dikontrol via Bot Tele" -ForegroundColor Green
 Write-Host "==========================================================" -ForegroundColor Cyan
-Write-Host "Tekan [ENTER] untuk menutup jendela ini..."
-Read-Host
+
+if ([Environment]::UserInteractive -and -not $NonInteractive) {
+    Write-Host "`nTekan [ENTER] untuk menutup jendela ini..."
+    Read-Host
+}
