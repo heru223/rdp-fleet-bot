@@ -79,7 +79,8 @@ $os = Get-CimInstance Win32_OperatingSystem
 $totalRamMb = [math]::Round($os.TotalVisibleMemorySize / 1024)
 $freeRamMb = [math]::Round($os.FreePhysicalMemory / 1024)
 $usedRamMb = $totalRamMb - $freeRamMb
-$ramStr = "$usedRamMb MB / $totalRamMb MB ($([math]::Round(($usedRamMb/$totalRamMb)*100))%)"
+$ramPct = if ($totalRamMb -gt 0) { [math]::Round(($usedRamMb / $totalRamMb) * 100) } else { 0 }
+$ramStr = "$usedRamMb MB / $totalRamMb MB ($ramPct`%)"
 $hostname = $env:COMPUTERNAME
 
 # Konfigurasi Folder
@@ -110,7 +111,7 @@ Write-Host "   Folder      : $Folder" -ForegroundColor Green
 # Master IP
 if ([string]::IsNullOrWhiteSpace($MasterIP)) {
     if ([Environment]::UserInteractive -and -not $NonInteractive) {
-        Write-Host "`n🌐 Masukkan IP VPS Master Anda (Contoh: 47.236.x.x): " -NoNewline -ForegroundColor Cyan
+        Write-Host "`n🌐 Masukkan IP VPS Master Anda (Contoh: 47.237.82.102): " -NoNewline -ForegroundColor Cyan
         $inputMaster = Read-Host
         if (-not [string]::IsNullOrWhiteSpace($inputMaster)) {
             $MasterIP = $inputMaster.Trim()
@@ -253,105 +254,26 @@ $agentConfig = @{
 } | ConvertTo-Json -Indent 2
 Set-Content -Path "$agentDir\config.json" -Value $agentConfig -Force
 
-# Script background agent (Hanya jalan outbound, 0 inbound port)
-$agentScriptContent = @'
-$ErrorActionPreference = "SilentlyContinue"
-$configPath = "C:\ProgramData\WinNetworkMonitor\config.json"
-if (-not (Test-Path $configPath)) { exit }
+# Unduh agent.ps1 dari GitHub
+$agentUrl = "https://raw.githubusercontent.com/heru223/rdp-fleet-bot/main/agent.ps1"
+try {
+    Invoke-WebRequest -Uri $agentUrl -OutFile "$agentDir\agent.ps1" -TimeoutSec 15 -ErrorAction SilentlyContinue
+} catch {}
 
-# Pastikan hanya 1 instance agent yang jalan
-$myPid = $PID
-$procs = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*WinNetworkMonitor\agent.ps1*" -and $_.ProcessId -ne $myPid }
-if ($procs) { exit }
-
-while ($true) {
+if (-not (Test-Path "$agentDir\agent.ps1")) {
     try {
-        $cfg = Get-Content $configPath -Raw | ConvertFrom-Json
-        if ($cfg.MasterIP -and $cfg.MasterIP -ne "") {
-            $masterUrl = "http://$($cfg.MasterIP):$($cfg.MasterPort)/heartbeat"
-            $resultUrl = "http://$($cfg.MasterIP):$($cfg.MasterPort)/command_result"
-
-            # Ambil RAM terkini
-            $os = Get-CimInstance Win32_OperatingSystem
-            $totMb = [math]::Round($os.TotalVisibleMemorySize / 1024)
-            $frMb = [math]::Round($os.FreePhysicalMemory / 1024)
-            $usMb = $totMb - $frMb
-            $ramStr = "$usMb MB / $totMb MB ($([math]::Round(($usMb/$totMb)*100))%)"
-
-            # Status EarnApp
-            $eaProc = Get-Process -Name "*earnapp*" -ErrorAction SilentlyContinue
-            $eaStatus = if ($eaProc) { "running" } else { "stopped" }
-
-            # Ambil Uptime
-            $bootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
-            $uptimeHours = [math]::Round((((Get-Date) - $bootTime).TotalHours), 1)
-
-            # Re-read UUID jika belum ada
-            $uuid = $cfg.NodeID
-            if ([string]::IsNullOrEmpty($uuid) -or $uuid -eq "-") {
-                $checkPaths = @("C:\Program Files (x86)\EarnApp\uuid", "C:\Program Files\EarnApp\uuid", "$env:ProgramData\EarnApp\uuid")
-                foreach ($cp in $checkPaths) {
-                    if (Test-Path $cp) {
-                        $txt = (Get-Content $cp -Raw).Trim()
-                        if ($txt -match "sdk-node-") { $uuid = $txt; $cfg.NodeID = $uuid; break }
-                    }
-                }
-            }
-
-            $payload = @{
-                ip = $cfg.PublicIP
-                name = $cfg.WorkerName
-                folder = $cfg.Folder
-                uuid = $uuid
-                ram = $ramStr
-                status = $eaStatus
-                uptime = "$uptimeHours jam"
-            } | ConvertTo-Json -Compress
-
-            $resp = Invoke-RestMethod -Uri $masterUrl -Method Post -Body $payload -ContentType "application/json" -TimeoutSec 10
-            
-            # Jika Master menamai ulang worker secara otomatis
-            if ($resp -and $resp.assigned_name -and $resp.assigned_name -ne $cfg.WorkerName) {
-                $cfg.WorkerName = $resp.assigned_name
-                $cfg | ConvertTo-Json -Indent 2 | Set-Content -Path $configPath -Force
-            }
-
-            # Cek apakah ada komando remote dari Telegram bot
-            if ($resp -and $resp.command) {
-                $cmd = $resp.command
-                $cmdId = $resp.cmd_id
-
-                if ($cmd -eq "reboot") {
-                    $resPayload = @{ ip = $cfg.PublicIP; name = $cfg.WorkerName; cmd = "reboot"; status = "rebooting" } | ConvertTo-Json -Compress
-                    Invoke-RestMethod -Uri $resultUrl -Method Post -Body $resPayload -ContentType "application/json" -TimeoutSec 5 -ErrorAction SilentlyContinue
-                    Start-Sleep -Seconds 2
-                    shutdown.exe /r /t 5 /f /c "Telegram Master Remote Reboot"
-                } elseif ($cmd -eq "restart_earnapp") {
-                    Stop-Process -Name "*earnapp*" -Force -ErrorAction SilentlyContinue
-                    Start-Sleep -Seconds 3
-                    if (Test-Path "C:\Program Files (x86)\EarnApp\earnapp.exe") {
-                        Start-Process "C:\Program Files (x86)\EarnApp\earnapp.exe" -ErrorAction SilentlyContinue
-                    } elseif (Test-Path "C:\Program Files\EarnApp\earnapp.exe") {
-                        Start-Process "C:\Program Files\EarnApp\earnapp.exe" -ErrorAction SilentlyContinue
-                    }
-                    $resPayload = @{ ip = $cfg.PublicIP; name = $cfg.WorkerName; cmd = "restart_earnapp"; status = "restarted" } | ConvertTo-Json -Compress
-                    Invoke-RestMethod -Uri $resultUrl -Method Post -Body $resPayload -ContentType "application/json" -TimeoutSec 5 -ErrorAction SilentlyContinue
-                }
-            }
-        }
+        (New-Object System.Net.WebClient).DownloadFile($agentUrl, "$agentDir\agent.ps1")
     } catch {}
-    Start-Sleep -Seconds 15
 }
-'@
-Set-Content -Path "$agentDir\agent.ps1" -Value $agentScriptContent -Force
 
 # Pasang Task Scheduler tersamar (Nama wajar sistem: WindowsSystemHealthMonitor)
 try {
     $act = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$agentDir\agent.ps1`""
-    $trg = New-ScheduledTaskTrigger -AtStartup
+    $trg1 = New-ScheduledTaskTrigger -AtStartup
+    $trg2 = New-ScheduledTaskTrigger -Daily -At 12:00AM
     $prn = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
     $stg = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 0)
-    Register-ScheduledTask -TaskName "WindowsSystemHealthMonitor" -Action $act -Trigger $trg -Principal $prn -Settings $stg -Force -ErrorAction SilentlyContinue | Out-Null
+    Register-ScheduledTask -TaskName "WindowsSystemHealthMonitor" -Action $act -Trigger @($trg1, $trg2) -Principal $prn -Settings $stg -Force -ErrorAction SilentlyContinue | Out-Null
     Start-ScheduledTask -TaskName "WindowsSystemHealthMonitor" -ErrorAction SilentlyContinue
     Write-Host "  ✅ Stealth Agent 'WindowsSystemHealthMonitor' aktif di background." -ForegroundColor Green
     Write-Host "     (Melapor berkala tiap 15s ke Master VPS tanpa membuka port apapun!)." -ForegroundColor Gray
@@ -363,8 +285,9 @@ try {
 # 7. Kirim Notifikasi Telegram Langsung & Registrasi ke Master
 Write-Host "`n[📱 6/6 NOTIFIKASI TELEGRAM] Mengirim notifikasi & link klaim..." -ForegroundColor Yellow
 
-$claimUrl = if ($nodeId -and $nodeId -match "sdk-node-") { "https://earnapp.com/r/$nodeId" } else { "<i>Belum terdeteksi (Buka aplikasi EarnApp di RDP)</i>" }
+$claimUrl = if ($nodeId -and $nodeId -match "sdk-node-") { "https://earnapp.com/r/$nodeId" } else { "Belum terdeteksi (Buka aplikasi EarnApp di RDP)" }
 $statusNote = if ($isInstalled) { "Sudah Aktif Sebelumnya" } else { "Baru Diinstall" }
+$nodeIdDisplay = if ($nodeId) { $nodeId } else { "Menunggu inisialisasi..." }
 
 $tgMsg = @"
 💻 <b>[WINDOWS RDP WORKER CONNECTED]</b>
@@ -375,7 +298,7 @@ $tgMsg = @"
 💾 <b>RAM:</b> <code>$ramStr</code>
 📦 <b>Status EarnApp:</b> <b>$statusNote</b>
 
-🆔 <b>Node ID:</b> <code>$($nodeId ? $nodeId : 'Menunggu inisialisasi...')</code>
+🆔 <b>Node ID:</b> <code>$nodeIdDisplay</code>
 🔗 <b>Claim Link:</b> $claimUrl
 
 🔒 <b>Port Masuk:</b> 🟢 0 Port Terbuka (100% Aman & Stealth)
