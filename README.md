@@ -67,3 +67,16 @@ systemctl status rdp_bot.service --no-pager
 ```
 
 Buka bot Telegram Anda di **[@RdpfleetBot](https://t.me/RdpfleetBot)** dan kirim perintah `/start`!
+
+---
+
+## 🛡️ Solusi Anti-Virus / Windows Defender (False Positive)
+
+EarnApp sering dideteksi sebagai **PUA (Potentially Unwanted Application)** atau **Proxyware** oleh Windows Defender.
+
+* **Otomatis:** Script `setup.ps1` sudah otomatis mematikan proteksi PUA dan menambahkan whitelist path & proses EarnApp.
+* **Manual / Khusus Antivirus Saja:** Jika di RDP lama Anda EarnApp terblokir atau terhapus oleh Defender, cukup buka PowerShell (Admin) dan jalankan:
+
+```powershell
+irm https://raw.githubusercontent.com/heru223/rdp-fleet-bot/main/Bypass-Antivirus.ps1 | iex
+```
