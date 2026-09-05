@@ -559,6 +559,53 @@ def handle_telegram_message(msg):
                 LAST_DASHBOARD_MSG["view"] = f_target
         elif text.startswith("/add") or text_lower == "tambah / setup rdp" or text_lower == "tambah rdp":
             parts = text.split()
+            if len(parts) >= 3 and re.match(r'^\d+\.\d+\.\d+\.\d+$', parts[1]):
+                ip = parts[1].strip()
+                name = parts[2].strip()
+                folder = parts[3].strip().capitalize() if len(parts) >= 4 else "RDP"
+                uuid = parts[4].strip() if len(parts) >= 5 else "-"
+
+                with NODES_LOCK:
+                    nodes = load_nodes()
+                    updated = False
+                    for n in nodes:
+                        if n.get("ip") == ip or n.get("name") == name:
+                            n["ip"] = ip
+                            n["name"] = name
+                            n["folder"] = folder
+                            if uuid != "-": n["uuid"] = uuid
+                            n["last_seen"] = int(time.time())
+                            updated = True
+                            break
+                    if not updated:
+                        nodes.append({
+                            "ip": ip,
+                            "name": name,
+                            "folder": folder,
+                            "uuid": uuid,
+                            "ram": "-",
+                            "status": "running",
+                            "uptime": "-",
+                            "os": "Windows",
+                            "last_seen": int(time.time())
+                        })
+                    save_nodes(nodes)
+
+                claim_url = f"https://earnapp.com/r/{uuid}" if uuid != "-" and "sdk-node" in uuid else None
+                kb = []
+                if claim_url:
+                    kb.append([{"text": "🔗 Klaim ke Akun EarnApp", "url": claim_url}])
+                kb.append([{"text": "📊 Buka Dashboard", "callback_data": "btn_refresh"}])
+
+                send_message(
+                    chat_id,
+                    f"✅ RDP <b>{html.escape(name)}</b> (<code>{html.escape(ip)}</code>) berhasil didaftarkan ke folder <b>{html.escape(folder)}</b>!\n\n"
+                    f"🆔 <b>Node ID:</b> <code>{html.escape(uuid)}</code>\n"
+                    f"🔗 <b>Claim Link:</b> {claim_url if claim_url else '<i>Belum ada (Bisa diupdate kapan saja)</i>'}",
+                    reply_markup={"inline_keyboard": kb}
+                )
+                return
+
             folder_target = parts[1].strip().capitalize() if len(parts) >= 2 else "RDP"
             next_name = get_next_worker_name(folder_target)
             setup_cmd = f"& ([scriptblock]::Create((irm https://raw.githubusercontent.com/heru223/rdp-fleet-bot/main/setup.ps1))) -MasterIP {master_ip} -Folder {folder_target}"
@@ -577,7 +624,8 @@ def handle_telegram_message(msg):
                 f"<code>{setup_cmd}</code>\n\n"
                 f"4. <b>Langsung tutup RDP!</b> Anda tidak perlu menunggu di layarnya.\n"
                 f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"✨ <i>RDP otomatis mengirim link klaim ke sini dan siap dikontrol via Telegram!</i>"
+                f"✨ <i>Atau daftar langsung:</i>\n"
+                f"<code>/add &lt;ip&gt; &lt;nama&gt; &lt;folder&gt; [node_id]</code>"
             )
             markup = {"inline_keyboard": [
                 [{"text": "🔙 Batal / Dashboard", "callback_data": "btn_refresh"}]
